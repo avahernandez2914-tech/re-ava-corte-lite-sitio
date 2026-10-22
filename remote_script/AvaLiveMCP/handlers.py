@@ -428,6 +428,34 @@ class Handlers(object):
         track.duplicate_clip_to_arrangement(clip, float(time))
         return {"time": float(time), "length": clip.length}
 
+    def cmd_load_audio_file(self, track_index, file_path, slot_index=None, arrangement_time=None,
+                            warping=None, name=None):
+        """Load an audio file into an audio track (Live 12+): into the Arrangement at arrangement_time,
+        or into Session slot slot_index."""
+        track = self._track(track_index)
+        if track.has_midi_input:
+            raise CommandError("La pista %d es MIDI; usa una pista de audio" % track_index)
+        if arrangement_time is not None:
+            if not hasattr(track, "create_audio_clip"):
+                raise CommandError("Tu versión de Live no permite cargar audio en el Arrangement por API "
+                                   "(requiere Live 12)")
+            clip = track.create_audio_clip(str(file_path), float(arrangement_time))
+        else:
+            slot = self._clip_slot(track_index, int(slot_index or 0), create_scenes=True)
+            if not hasattr(slot, "create_audio_clip"):
+                raise CommandError("Tu versión de Live no permite cargar audio por API (requiere Live 12)")
+            if slot.has_clip:
+                slot.delete_clip()
+            slot.create_audio_clip(str(file_path))
+            clip = slot.clip
+        if clip is not None:
+            if warping is not None and hasattr(clip, "warping"):
+                clip.warping = bool(warping)
+            if name:
+                clip.name = name
+        return {"track_index": track_index, "file_path": str(file_path),
+                "length": getattr(clip, "length", None)}
+
     def cmd_get_arrangement_clips(self, track_index):
         track = self._track(track_index)
         clips = getattr(track, "arrangement_clips", None) or []

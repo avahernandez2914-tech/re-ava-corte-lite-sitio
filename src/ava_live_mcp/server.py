@@ -563,6 +563,93 @@ def create_song(genre: str = "reggaeton", key: str | None = None, progression: s
 
 
 # ---------------------------------------------------------------------------
+# Imported songs (output of scripts/separar_cancion.py)
+
+AUDIO_STEMS = ["Voz principal", "Coros", "Bateria", "Bajo", "Otros"]
+MIX_STEMS = ["Instrumental", "Voz completa"]
+MIDI_PARTS = {  # part -> (track name, browser category, instrument candidates)
+    "melody": ("Melodía voz (MIDI)", "instruments", ["Drift", "Wavetable", "Analog"]),
+    "chords": ("Acordes (MIDI)", "instruments", ["Electric", "Wavetable", "Drift"]),
+    "bass": ("Bajo (MIDI)", "instruments", ["Operator", "Drift", "Analog"]),
+    "other": ("Otros (MIDI)", "instruments", ["Wavetable", "Drift"]),
+    "drums": ("Batería (MIDI)", "drums", ["808 Core Kit", "909 Core Kit", "Kit"]),
+}
+
+
+@mcp.tool()
+def import_song(folder: str, midi_parts: list[Literal["melody", "chords", "bass", "other", "drums"]] | None = None,
+                include_mix_stems: bool = False, mute_midi: bool = True, load_instruments: bool = True,
+                new_vocal_tracks: int = Field(1, ge=0, le=8), to_arrangement: bool = True) -> dict:
+    """Monta en Live una canción separada con scripts/separar_cancion.py (carpeta con song.json).
+
+    Crea: pistas de audio por stem (voz principal, coros, batería, bajo, otros) alineadas en el
+    Arrangement; pistas MIDI con instrumentos para melodía, acordes, bajo, otros y batería
+    (silenciadas por defecto para que suene el original: desmútalas para reemplazar partes);
+    y pistas de audio vacías "Nueva voz" para grabar o añadir otra voz.
+    Pon el tempo detectado y no borra nada existente.
+    """
+    import json
+    from pathlib import Path
+
+    root = Path(folder).expanduser()
+    meta_file = root / "song.json"
+    if not meta_file.exists():
+        raise ToolError(f"No encuentro {meta_file}. Primero ejecuta scripts/separar_cancion.py")
+    song = json.loads(meta_file.read_text(encoding="utf-8"))
+    bpm = song["bpm"]
+    live("set_tempo", tempo=bpm)
+    session = live("get_session_info", include_clips=True)
+    used = [c["slot"] for t in session["tracks"] for c in t.get("clips", [])]
+    slot = max(used) + 1 if used else 0
+    length_beats = song["duration_seconds"] * bpm / 60.0
+    clip_len = max(4.0, -(-length_beats // 4) * 4)  # whole bars
+
+    created: dict[str, Any] = {"audio": {}, "midi": {}, "new_vocals": []}
+    warnings = []
+    stems = [s for s in AUDIO_STEMS + (MIX_STEMS if include_mix_stems else []) if s in song["stems"]]
+    for name in stems:
+        path = (root / song["stems"][name]).resolve()
+        t = live("create_track", type="audio", name=name)
+        try:
+            if to_arrangement:
+                live("load_audio_file", track_index=t["index"], file_path=str(path), arrangement_time=0.0,
+                     warping=False, name=name)
+            else:
+                live("load_audio_file", track_index=t["index"], file_path=str(path), slot_index=slot,
+                     warping=False, name=name)
+        except ToolError as e:
+            warnings.append(f"{name}: {e}. Arrastra {path} a la pista.")
+        created["audio"][name] = t["index"]
+
+    for _ in range(new_vocal_tracks):
+        t = live("create_track", type="audio", name="Nueva voz")
+        created["new_vocals"].append(t["index"])
+
+    for part in midi_parts or list(MIDI_PARTS):
+        notes = [n for n in song["parts"].get(part, []) if n["start"] < clip_len]
+        if not notes:
+            continue
+        track_name, category, candidates = MIDI_PARTS[part]
+        t = live("create_track", type="midi", name=track_name)
+        if load_instruments:
+            created.setdefault("instruments", {})[part] = _load_first(t["index"], candidates, category)
+        live("write_clip", track_index=t["index"], slot_index=slot, notes=notes, length=clip_len,
+             name=track_name)
+        if to_arrangement:
+            live("clip_to_arrangement", track_index=t["index"], slot_index=slot, time=0.0)
+        if mute_midi:
+            live("set_track", track_index=t["index"], mute=True)
+        created["midi"][part] = t["index"]
+
+    if to_arrangement:
+        live("set_song_position", time=0.0)
+    return {"bpm": bpm, "key": song["key"], "chords_per_bar": song["chords_per_bar"][:32],
+            "most_common_chords": song.get("most_common_chords"), "tracks": created, "warnings": warnings,
+            "tip": "Las pistas MIDI están silenciadas: desmútalas y silencia el stem original para "
+                   "reemplazar esa parte. Graba la nueva voz en 'Nueva voz'."}
+
+
+# ---------------------------------------------------------------------------
 # Prompts
 
 @mcp.prompt()

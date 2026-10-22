@@ -1,0 +1,8 @@
+# Dependencias para scripts/separar_cancion.py (Python 3.10-3.11). Requiere ffmpeg en el sistema.
+# GPU NVIDIA: cambia "audio-separator[cpu]" por "audio-separator[gpu]" (mucho más rápido).
+audio-separator[cpu]
+basic-pitch[onnx]
+librosa
+soundfile
+numpy<2
+setuptools<70

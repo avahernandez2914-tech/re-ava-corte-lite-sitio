@@ -55,6 +55,11 @@ class ClipSlot:
     def delete_clip(self):
         self.clip = None
 
+    def create_audio_clip(self, path):
+        self.clip = Clip(16.0)
+        self.clip.is_midi_clip = False
+        self.clip.file_path = path
+
     def fire(self):
         pass
 
@@ -86,6 +91,12 @@ class Track:
 
     def delete_clip(self, clip):
         self.arrangement_clips.remove(clip)
+
+    def create_audio_clip(self, path, position):
+        clip = SimpleNamespace(name="", file_path=path, start_time=position, end_time=position + 16.0,
+                               length=16.0, warping=True)
+        self.arrangement_clips.append(clip)
+        return clip
 
 
 class Scene:

@@ -101,6 +101,40 @@ Abre un set en Live y pídele cosas a Claude. Por ejemplo:
 
 También tienes el prompt **`produce_song`**: Claude te propone el plan, espera tu visto bueno y luego produce.
 
+### Importar una canción existente: separar stems, voz, acordes y MIDI
+
+`scripts/separar_cancion.py` toma un MP3, WAV, M4A o FLAC y genera una carpeta con:
+
+- **stems/**: voz principal, coros, batería, bajo, otros (teclados, guitarras, sintes),
+  instrumental sin voz y voz completa. Están en WAV 24 bits, con la misma duración, para que queden alineados.
+- **midi/**: melodía de la voz, acordes, bajo, otros instrumentos y batería.
+- **song.json**: BPM, tonalidad y acordes por compás.
+
+```bash
+# una sola vez (Python 3.10-3.11 y ffmpeg instalados)
+uv venv -p 3.11 .venv-separar && uv pip install -p .venv-separar -r scripts/requirements-separacion.txt
+# cada canción
+.venv-separar/bin/python scripts/separar_cancion.py "Mi cancion.mp3" --out "Mi cancion"
+```
+
+En Windows, el intérprete está en `.venv-separar\Scripts\python`. Los modelos (unos 1.6 GB) se descargan
+la primera vez. En CPU tarda unos 10 minutos por cada minuto de canción; con GPU NVIDIA es mucho más rápido.
+
+Después, pídele a Claude: *"Importa la canción de la carpeta /ruta/Mi cancion"*. La herramienta
+`import_song` hace esto:
+- pone el tempo detectado;
+- crea una pista de audio por stem, alineadas en el Arrangement;
+- crea pistas MIDI con instrumentos (melodía, acordes, bajo, otros y batería), silenciadas para que
+  suene el original;
+- crea una pista vacía **"Nueva voz"** para grabar o añadir otra voz.
+
+Para reemplazar una parte, silencia su stem y activa su pista MIDI. Cargar audio por API requiere
+**Live 12**; en Live 11 tendrás que arrastrar los WAV a mano.
+
+Modelos usados: BS-Roformer (voz), Mel-Roformer Karaoke (voz principal y coros), MDX-Net de
+kuielab (batería y bajo) y Basic Pitch de Spotify (audio a MIDI). La separación es muy buena pero no
+perfecta. El MIDI de acordes y de "otros" es aproximado y conviene revisarlo.
+
 ### Herramientas que tiene Claude
 
 | Área | Herramientas |
@@ -110,6 +144,7 @@ También tienes el prompt **`produce_song`**: Claude te propone el plan, espera 
 | Clips | `write_notes`, `get_clip`, `delete_clip`, `duplicate_clip`, `set_clip`, `quantize_clip`, `fire_clip`, `stop_track` |
 | Sonido | `search_browser`, `browse`, `load_device`, `get_devices`, `set_device_parameter`, `delete_device` |
 | Arrangement | `session_to_arrangement`, `get_arrangement_clips`, `clear_arrangement` |
+| Canciones importadas | `import_song` (stems + MIDI + pista "Nueva voz") |
 | Composición | `list_genres`, `describe_progression`, `generate_drum_clip`, `generate_bass_clip`, `generate_chord_clip`, `generate_melody_clip`, `create_song` |
 
 ### Convenciones

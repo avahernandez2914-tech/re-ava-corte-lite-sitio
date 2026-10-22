@@ -112,3 +112,28 @@ def test_generators_write_clips(live):
     call("session_to_arrangement", scene_order=[0, 1, 0])
     # scene 0 is 8 beats (drums), scene 1 is 16 beats (chords): 0, 8, 24
     assert [c.start_time for c in live.tracks[1].arrangement_clips] == [0.0, 8.0, 24.0]
+
+
+def test_import_song(live, tmp_path):
+    stems = {"Voz principal": "stems/01 Voz principal.wav", "Coros": "stems/02 Coros.wav",
+             "Bateria": "stems/03 Bateria.wav", "Bajo": "stems/04 Bajo.wav", "Otros": "stems/05 Otros.wav",
+             "Instrumental": "stems/06 Instrumental.wav"}
+    song = {"bpm": 100.0, "key": "A minor", "duration_seconds": 30.0, "chords_per_bar": ["Am Am", "F F"],
+            "most_common_chords": ["Am (2)"], "stems": stems,
+            "parts": {"bass": [{"pitch": 33, "start": 0, "duration": 1, "velocity": 100}],
+                      "chords": [{"pitch": 57, "start": 0, "duration": 2, "velocity": 90}],
+                      "melody": [], "other": [], "drums": [{"pitch": 36, "start": 0, "duration": 0.25,
+                                                            "velocity": 110}]}}
+    (tmp_path / "song.json").write_text(json.dumps(song))
+    out = call("import_song", folder=str(tmp_path))
+    assert live.tempo == 100.0 and out["key"] == "A minor"
+    names = [t.name for t in live.tracks]
+    assert names == ["Voz principal", "Coros", "Bateria", "Bajo", "Otros", "Nueva voz",
+                     "Acordes (MIDI)", "Bajo (MIDI)", "Batería (MIDI)"]
+    vocal = live.tracks[0].arrangement_clips[0]
+    assert vocal.file_path == str((tmp_path / stems["Voz principal"]).resolve()) and vocal.warping is False
+    bass_midi = live.tracks[7]
+    assert bass_midi.mute and bass_midi.devices[0].name == "Operator"
+    assert bass_midi.clip_slots[0].clip.length == 52.0  # 30 s at 100 BPM = 50 beats -> 13 bars
+    assert bass_midi.arrangement_clips[0].start_time == 0.0
+    assert out["warnings"] == []
