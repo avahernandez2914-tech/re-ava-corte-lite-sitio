@@ -30,6 +30,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from ava_live_mcp.theory import NOTE_NAMES, Chord, voice_chord  # noqa: E402
 
 SR = 44100
+STEM_FILES = {
+    "Voz principal": "01 Voz principal.wav", "Coros": "02 Coros.wav", "Bateria": "03 Bateria.wav",
+    "Bajo": "04 Bajo.wav", "Otros": "05 Otros (teclados, guitarras, sintes).wav",
+    "Instrumental": "06 Instrumental (sin voz).wav", "Voz completa": "07 Voz completa.wav",
+}
 MODELS = {
     "vocals": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
     "karaoke": "mel_band_roformer_karaoke_aufr33_viperx_sdr_10.1956.ckpt",
@@ -96,19 +101,26 @@ def detect_key(chroma_sum: np.ndarray) -> tuple[int, str]:
     return best[1], best[2]
 
 
-def resolve_relative(tonic: int, scale: str, chords: list) -> tuple[int, str]:
-    """Pick between a major key and its relative minor using which tonic chord dominates."""
-    major = tonic if scale == "major" else (tonic + 3) % 12
-    minor = (major + 9) % 12
+MAJOR_TRIADS = [(0, ""), (2, "m"), (4, "m"), (5, ""), (7, ""), (9, "m")]
+MINOR_TRIADS = [(0, "m"), (3, ""), (5, "m"), (7, "m"), (7, ""), (8, ""), (10, "")]  # incl. harmonic V
+
+
+def key_from_chords(chords: list, profile_key: tuple[int, str]) -> tuple[int, str]:
+    """Key whose diatonic triads cover the most chord time; ties go to the tonic chord heard most."""
     found = [c for c in chords if c is not None]
+    if not found:
+        return profile_key
     counts = Counter(found)
-    n_major, n_minor = counts[(major, "")], counts[(minor, "m")]
-    if n_major == n_minor:
-        for c in found:  # tie: the first tonic chord heard wins
-            if c in ((major, ""), (minor, "m")):
-                return (major, "major") if c == (major, "") else (minor, "minor")
-        return tonic, scale
-    return (major, "major") if n_major > n_minor else (minor, "minor")
+    best = None
+    for tonic in range(12):
+        for scale, triads in (("major", MAJOR_TRIADS), ("minor", MINOR_TRIADS)):
+            diatonic = {((tonic + r) % 12, q) for r, q in triads}
+            coverage = sum(n for c, n in counts.items() if c in diatonic)
+            tonic_chord = counts[(tonic, "" if scale == "major" else "m")]
+            score = (coverage, tonic_chord, (tonic, scale) == profile_key)
+            if best is None or score > best[0]:
+                best = (score, (tonic, scale))
+    return best[1]
 
 
 def _templates():
@@ -126,14 +138,14 @@ def _templates():
 
 def detect_chords(harm: np.ndarray, bass: np.ndarray, beat_frames: np.ndarray, hop: int,
                   beats_per_chord: int = 2) -> list[tuple[int, str] | None]:
-    """One chord per ``beats_per_chord`` beats, from harmonic + bass chroma."""
+    """One chord per ``beats_per_chord`` beats (window starts at beat_frames[0]), from harmonic + bass chroma."""
     import librosa
 
     ch = librosa.feature.chroma_cqt(y=harm, sr=SR, hop_length=hop)
     cb = librosa.feature.chroma_cqt(y=bass, sr=SR, hop_length=hop, fmin=librosa.note_to_hz("C1"), n_octaves=3)
     n = min(ch.shape[1], cb.shape[1])
     combined = ch[:, :n] + 0.6 * cb[:, :n]
-    sync = librosa.util.sync(combined, beat_frames, aggregate=np.median)
+    sync = librosa.util.sync(combined, beat_frames, aggregate=np.median, pad=False)
     names, mats = _templates()
     chords = []
     for start in range(0, sync.shape[1], beats_per_chord):
@@ -148,6 +160,98 @@ def detect_chords(harm: np.ndarray, bass: np.ndarray, beat_frames: np.ndarray, h
         if chords[i - 1] == chords[i + 1] and chords[i] != chords[i - 1]:
             chords[i] = chords[i - 1]
     return chords
+
+
+def find_downbeat(per_beat: list) -> int:
+    """Beat offset (0-3) where chord changes line up with bar starts."""
+    changes = [i for i in range(1, len(per_beat)) if per_beat[i] != per_beat[i - 1] and per_beat[i] is not None]
+    if not changes:
+        return 0
+    return max(range(4), key=lambda o: (sum((i - o) % 4 == 0 for i in changes), sum((i - o) % 2 == 0 for i in changes)))
+
+
+def estimate_period(y: np.ndarray, hop: int = 128) -> float:
+    """Beat period in seconds from a comb of onset autocorrelations (more robust than beat_track on
+    syncopated/ternary grooves, where it locks onto 2/3 or 3/2 of the real beat)."""
+    import librosa
+
+    env = librosa.onset.onset_strength(y=y, sr=SR, hop_length=hop)
+    env = (env - env.mean()) / (env.std() or 1.0)
+
+    def ac(sec):
+        lag = int(round(sec * SR / hop))
+        return float((env[:-lag] * env[lag:]).mean()) if 0 < lag < len(env) else 0.0
+
+    def comb(period, span=8.0):
+        # Same time span for every candidate so short periods get no advantage from extra multiples.
+        ks = range(1, int(span / period) + 1)
+        return sum(ac(k * period) for k in ks) / len(ks)
+
+    coarse = np.arange(60 / 200, 60 / 50, 0.004)
+    best = max(coarse, key=comb)
+    fine = np.arange(best - 0.006, best + 0.006, 0.0002)
+    return float(max(fine, key=comb))
+
+
+def kick_phase(drums_mono: np.ndarray, beat_sec: float) -> float:
+    """Offset (s) of the beat grid that best lines up with kick onsets."""
+    import librosa
+    from scipy.signal import butter, sosfiltfilt
+
+    low = sosfiltfilt(butter(4, 120, btype="lowpass", fs=SR, output="sos"), drums_mono)
+    env = librosa.onset.onset_strength(y=low, sr=SR, hop_length=128)
+    duration = len(drums_mono) / SR
+
+    def score(phase):
+        frames = librosa.time_to_frames(np.arange(phase, duration, beat_sec), sr=SR, hop_length=128)
+        return env[np.clip(frames, 0, len(env) - 1)].sum()
+
+    return float(max(np.arange(0, beat_sec, beat_sec / 64), key=score))
+
+
+def chord_segments(per_beat: list, min_beats: int = 2) -> list[list]:
+    """Merge per-beat chords into [chord, start_beat_index, beats] segments, absorbing short blips."""
+    segs = []
+    for i, c in enumerate(per_beat):
+        if segs and segs[-1][0] == c:
+            segs[-1][2] += 1
+        else:
+            segs.append([c, i, 1])
+    changed = True
+    while changed and len(segs) > 1:
+        changed = False
+        for j, (c, start, n) in enumerate(segs):
+            if n >= min_beats and c is not None:
+                continue
+            # Give the blip to the longer neighbour.
+            prev_n = segs[j - 1][2] if j > 0 else -1
+            next_n = segs[j + 1][2] if j + 1 < len(segs) else -1
+            if c is None and n >= min_beats:
+                continue  # keep real silences
+            k = j - 1 if prev_n >= next_n else j + 1
+            if k < j:
+                segs[k][2] += n
+            else:
+                segs[k][1], segs[k][2] = start, segs[k][2] + n
+            del segs[j]
+            changed = True
+            break
+        # merge neighbours that became equal
+        merged = []
+        for seg in segs:
+            if merged and merged[-1][0] == seg[0]:
+                merged[-1][2] += seg[2]
+            else:
+                merged.append(seg)
+        segs = merged
+    return segs
+
+
+def main_loop(bars: list[str], size: int = 4) -> list[str]:
+    """Most repeated sequence of ``size`` consecutive chord changes in the bar-by-bar progression."""
+    names = [b for i, b in enumerate(bars) if b != "N" and (i == 0 or b != bars[i - 1])]
+    grams = Counter(tuple(names[i:i + size]) for i in range(len(names) - size + 1))
+    return list(grams.most_common(1)[0][0]) if grams else names
 
 
 def chord_symbol(c) -> str:
@@ -231,11 +335,20 @@ def main() -> None:
     ap.add_argument("--models", type=Path, default=Path.home() / ".cache" / "ava-live-mcp" / "models")
     ap.add_argument("--bpm", type=float, default=None, help="Fuerza el BPM si la detección falla")
     ap.add_argument("--no-backing", action="store_true", help="No separar voz principal de coros")
+    ap.add_argument("--reanalizar", action="store_true",
+                    help="Rehace solo el análisis y el MIDI usando los stems ya separados")
     args = ap.parse_args()
 
     song = args.song.resolve()
     out = (args.out or song.with_suffix("")).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    if args.reanalizar:
+        stems = {name: out / "stems" / f for name, f in STEM_FILES.items() if (out / "stems" / f).exists()}
+        if "Bateria" not in stems:
+            sys.exit(f"No hay stems en {out / 'stems'}; ejecuta sin --reanalizar")
+        mix = read(stems["Instrumental"]) + read(stems["Voz completa"])
+        analyze(out, song, stems, mix, args.bpm)
+        return
     args.models.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="separar_", dir=out))
 
@@ -265,60 +378,64 @@ def main() -> None:
     other = instrumental - drums - bass
 
     stems_dir = out / "stems"
-    stems = {
-        "Voz principal": write(stems_dir / "01 Voz principal.wav", lead),
-        "Coros": write(stems_dir / "02 Coros.wav", backing) if backing is not None else None,
-        "Bateria": write(stems_dir / "03 Bateria.wav", drums),
-        "Bajo": write(stems_dir / "04 Bajo.wav", bass),
-        "Otros": write(stems_dir / "05 Otros (teclados, guitarras, sintes).wav", other),
-        "Instrumental": write(stems_dir / "06 Instrumental (sin voz).wav", instrumental),
-        "Voz completa": write(stems_dir / "07 Voz completa.wav", vocals),
-    }
-    stems = {k: v for k, v in stems.items() if v is not None}
+    audio = {"Voz principal": lead, "Coros": backing, "Bateria": drums, "Bajo": bass, "Otros": other,
+             "Instrumental": instrumental, "Voz completa": vocals}
+    stems = {name: write(stems_dir / STEM_FILES[name], data) for name, data in audio.items() if data is not None}
+    analyze(out, song, stems, mix, args.bpm)
+    shutil.rmtree(tmp, ignore_errors=True)
 
+
+def analyze(out: Path, song: Path, stems: dict[str, Path], mix: np.ndarray, forced_bpm: float | None) -> None:
     log("4/4 Analizando tempo, tonalidad y acordes, y transcribiendo a MIDI")
     import librosa
 
+    length = len(mix)
+    drums = read(stems["Bateria"], length)
+    bass = read(stems["Bajo"], length)
+    other = read(stems["Otros"], length)
     hop = 512
     drums_mono = drums.mean(axis=1)
-    tempo, beat_frames = librosa.beat.beat_track(y=drums_mono if np.abs(drums_mono).max() > 0.01
-                                                 else mix.mean(axis=1), sr=SR, hop_length=hop)
-    bpm = float(np.atleast_1d(tempo)[0])
-    beat_times = librosa.frames_to_time(beat_frames, sr=SR, hop_length=hop)
-    if len(beat_times) > 8:  # the average beat period is more precise than the tempogram estimate
-        bpm = 60.0 / float(np.polyfit(np.arange(len(beat_times)), beat_times, 1)[0])
-    bpm = float(args.bpm or bpm)
-    if not args.bpm:
+    source = drums_mono if np.abs(drums_mono).max() > 0.01 else mix.mean(axis=1)
+    bpm = float(forced_bpm or 60.0 / estimate_period(source))
+    if not forced_bpm:
         while bpm < 70:
             bpm *= 2
         while bpm > 180:
             bpm /= 2
         # Most productions use whole-number tempos.
         bpm = float(round(bpm)) if abs(bpm - round(bpm)) < 0.75 else round(bpm, 2)
-    beat_frames = librosa.util.fix_frames(beat_frames, x_min=0)
-    first_beat = float(librosa.frames_to_time(beat_frames[1] if len(beat_frames) > 1 else 0, sr=SR,
-                                              hop_length=hop))
+    beat_sec = 60.0 / bpm
+    phase = kick_phase(source, beat_sec)
 
     other_mono = other.mean(axis=1)
     bass_mono = bass.mean(axis=1)
     chroma = librosa.feature.chroma_cqt(y=other_mono + bass_mono, sr=SR, hop_length=hop)
-    tonic, scale = detect_key(chroma.sum(axis=1))
+    profile_key = detect_key(chroma.sum(axis=1))
 
-    # Chords on a fixed grid from the detected tempo so they line up with the MIDI.
-    beat_sec = 60.0 / bpm
-    grid = librosa.time_to_frames(np.arange(0, length / SR, beat_sec), sr=SR, hop_length=hop)
-    chords = detect_chords(other_mono, bass_mono, grid, hop, beats_per_chord=2)
+    # Chords beat by beat (grid aligned to the kick), merged into segments at the real changes.
+    beat_grid = np.arange(phase, length / SR, beat_sec)
+    per_beat = detect_chords(other_mono, bass_mono, librosa.time_to_frames(beat_grid, sr=SR, hop_length=hop),
+                             hop, beats_per_chord=1)
+    segs = chord_segments(per_beat)
+    offset = find_downbeat(per_beat)
+    bar_start = phase + offset * beat_sec  # first downbeat, in seconds
+    while bar_start - 4 * beat_sec >= 0:
+        bar_start -= 4 * beat_sec
+    tonic, scale = key_from_chords([c for c, _, n in segs for _ in range(n)], profile_key)
 
-    tonic, scale = resolve_relative(tonic, scale, chords)
-
-    chord_notes, prev = [], None
-    for i, c in enumerate(chords):
+    phase_beats = phase / beat_sec
+    start_beats = bar_start / beat_sec
+    chord_notes, prev, timeline = [], None, []
+    for c, i, n in segs:
         if c is None:
             continue
+        start = round(phase_beats + i, 3)
+        timeline.append({"chord": chord_symbol(c), "start_beat": start, "beats": n,
+                         "bar": round((start - start_beats) / 4 + 1, 2), "seconds": round(start * beat_sec, 2)})
         ch = Chord(c[0], (0, 3, 7) if c[1] == "m" else (0, 4, 7), chord_symbol(c))
         prev = voice_chord(ch, 62, prev)
         for p in prev:
-            chord_notes.append({"pitch": p, "start": i * 2.0, "duration": 2.0, "velocity": 90})
+            chord_notes.append({"pitch": p, "start": start, "duration": float(n), "velocity": 90})
 
     parts = {
         "bass": transcribe(stems["Bajo"], bpm, low_hz=30, high_hz=400, monophonic=True, onset=0.4, frame=0.2),
@@ -331,26 +448,38 @@ def main() -> None:
     for name, notes in parts.items():
         write_midi(midi_dir / f"{name}.mid", notes, bpm, drums=name == "drums")
 
-    bars = [chord_symbol(c) for c in chords]
-    progression = [" ".join(bars[i:i + 2]) for i in range(0, len(bars), 2)]  # 2 chords per 4/4 bar
-    common = [f"{name} ({count})" for name, count in Counter(b for b in bars if b != "N").most_common(8)]
+    def chord_at(beat):
+        for seg in timeline:
+            if seg["start_beat"] <= beat < seg["start_beat"] + seg["beats"]:
+                return seg["chord"]
+        return "N"
+
+    n_bars = int((length / SR - bar_start) / (4 * beat_sec)) + 1
+    progression = [chord_at(start_beats + 4 * k + 0.5) for k in range(n_bars)]
+    beats_per_chord = Counter()
+    for seg in timeline:
+        beats_per_chord[seg["chord"]] += seg["beats"]
+    common = [f"{name} ({count // 4} compases)" for name, count in beats_per_chord.most_common(8)]
     analysis = {
         "source": song.name,
         "duration_seconds": round(length / SR, 2),
         "bpm": bpm,
-        "first_beat_seconds": round(first_beat, 3),
+        "first_downbeat_seconds": round(bar_start, 3),
+        "first_downbeat_beats": round(start_beats, 3),
         "key": f"{NOTE_NAMES[tonic]} {scale}",
+        "main_loop": main_loop(progression),
         "chords_per_bar": progression,
+        "chord_timeline": timeline,
         "most_common_chords": common,
         "stems": {k: str(v.relative_to(out)) for k, v in stems.items()},
         "midi": {k: f"midi/{k}.mid" for k in parts},
         "parts": parts,
     }
     (out / "song.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=1))
-    shutil.rmtree(tmp, ignore_errors=True)
 
     log(f"Listo en {out}")
-    log(f"BPM {bpm} · Tonalidad {analysis['key']} · acordes más usados: {', '.join(common[:6])}")
+    log(f"BPM {bpm} · Tonalidad {analysis['key']} · loop principal: {' - '.join(analysis['main_loop'])}")
+    log(f"Acordes más usados: {', '.join(common[:6])}")
 
 
 if __name__ == "__main__":
